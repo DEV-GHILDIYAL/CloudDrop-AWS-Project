@@ -1,0 +1,190 @@
+service: clouddrop-backend
+
+frameworkVersion: '3'
+
+provider:
+  name: aws
+  runtime: nodejs20.x
+  region: us-east-1
+  environment:
+    FILES_TABLE: ${self:custom.filesTableName}
+    UPLOAD_BUCKET: ${self:custom.uploadBucketName}
+  iam:
+    role:
+      statements:
+        - Effect: "Allow"
+          Action:
+            - dynamodb:PutItem
+            - dynamodb:Query
+            - dynamodb:DeleteItem
+            - dynamodb:GetItem
+          Resource:
+            - !GetAtt FilesTable.Arn
+        - Effect: "Allow"
+          Action:
+            - s3:PutObject
+            - s3:GetObject
+            - s3:DeleteObject
+          Resource:
+            - !Sub arn:aws:s3:::${self:custom.uploadBucketName}/*
+  apiGateway:
+    # Adding basic rate limiting to API Gateway
+    usagePlan:
+      quota:
+        limit: 5000
+        offset: 2
+        period: MONTH
+      throttle:
+        burstLimit: 200
+        rateLimit: 100
+
+custom:
+  filesTableName: clouddrop-files-${sls:stage}
+  uploadBucketName: clouddrop-upload-storage-${sls:stage}-${aws:accountId}
+
+functions:
+  generateUploadUrl:
+    handler: lambda/generateUploadUrl.handler
+    events:
+      - http:
+          path: upload-url
+          method: post
+          cors: true
+          authorizer:
+            name: cognitoAuthorizer
+            type: COGNITO_USER_POOLS
+            arn: !GetAtt CognitoUserPool.Arn
+
+  saveFileMetadata:
+    handler: lambda/saveFileMetadata.handler
+    events:
+      - http:
+          path: file
+          method: post
+          cors: true
+          authorizer:
+            name: cognitoAuthorizer
+            type: COGNITO_USER_POOLS
+            arn: !GetAtt CognitoUserPool.Arn
+
+  getFiles:
+    handler: lambda/getFiles.handler
+    events:
+      - http:
+          path: files
+          method: get
+          cors: true
+          authorizer:
+            name: cognitoAuthorizer
+            type: COGNITO_USER_POOLS
+            arn: !GetAtt CognitoUserPool.Arn
+
+  generateDownloadUrl:
+    handler: lambda/generateDownloadUrl.handler
+    events:
+      - http:
+          path: download/{userId}/{fileId}
+          method: get
+          cors: true
+          # Note: if users share links with others, we might want this to be public or handled differently.
+          # For public sharing, NO authorizer here, but we validate the userId and fileId via DynamoDB.
+
+  deleteFile:
+    handler: lambda/deleteFile.handler
+    events:
+      - http:
+          path: file/{userId}/{fileId}
+          method: delete
+          cors: true
+          authorizer:
+            name: cognitoAuthorizer
+            type: COGNITO_USER_POOLS
+            arn: !GetAtt CognitoUserPool.Arn
+
+resources:
+  Resources:
+    GatewayResponseDefault4XX:
+      Type: 'AWS::ApiGateway::GatewayResponse'
+      Properties:
+        ResponseParameters:
+          gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+          gatewayresponse.header.Access-Control-Allow-Headers: "'*'"
+        ResponseType: DEFAULT_4XX
+        RestApiId:
+          Ref: 'ApiGatewayRestApi'
+          
+    FilesTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:custom.filesTableName}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: userId
+            AttributeType: S
+          - AttributeName: fileId
+            AttributeType: S
+        KeySchema:
+          - AttributeName: userId
+            KeyType: HASH
+          - AttributeName: fileId
+            KeyType: RANGE
+        TimeToLiveSpecification:
+          Enabled: true
+          AttributeName: expiresAt
+
+    UploadBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: ${self:custom.uploadBucketName}
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: true
+          BlockPublicPolicy: true
+          IgnorePublicAcls: true
+          RestrictPublicBuckets: true
+        CorsConfiguration:
+          CorsRules:
+            - AllowedHeaders:
+                - "*"
+              AllowedMethods:
+                - PUT
+                - GET
+              AllowedOrigins:
+                - "*"
+              MaxAge: 3000
+        LifecycleConfiguration:
+          Rules:
+            - Id: DeleteOldFiles
+              Status: Enabled
+              ExpirationInDays: 30
+
+    CognitoUserPool:
+      Type: AWS::Cognito::UserPool
+      Properties:
+        UserPoolName: clouddrop-user-pool-${sls:stage}
+        UsernameAttributes:
+          - email
+        AutoVerifiedAttributes:
+          - email
+        Policies:
+          PasswordPolicy:
+            MinimumLength: 8
+            RequireLowercase: true
+            RequireNumbers: true
+            RequireSymbols: false
+            RequireUppercase: true
+
+    CognitoUserPoolClient:
+      Type: AWS::Cognito::UserPoolClient
+      Properties:
+        ClientName: clouddrop-web-client-${sls:stage}
+        UserPoolId: !Ref CognitoUserPool
+        ExplicitAuthFlows:
+          - ALLOW_USER_SRP_AUTH
+          - ALLOW_REFRESH_TOKEN_AUTH
+        PreventUserExistenceErrors: ENABLED
+
+  Outputs:
+    UserPoolId:
+      Value: !Ref CognitoUserPool
+    UserPoolClientId:
+      Value: !Ref CognitoUserPoolClient
